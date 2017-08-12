@@ -38,8 +38,6 @@ import time
 from StringIO import StringIO
 from collections import Counter
 
-import loom.tasks
-
 import bayeslite.core as core
 import bayeslite.metamodel as metamodel
 import bayeslite.util as util
@@ -50,7 +48,6 @@ from bayeslite.util import casefold
 from cgpm.mixtures.view import View
 from cgpm.utils.parallel_map import parallel_map
 from distributions.io.stream import open_compressed
-from loom.cFormat import assignment_stream_load
 
 # TODO should we use "generator" or "metamodel" in the name of
 
@@ -121,6 +118,45 @@ STATTYPE_TO_LOOMTYPE = {
 }
 
 
+class _Loom():
+    def __init__(self, loom_store_path):
+        self.loom_store_path = loom_store_path
+
+    def __enter__(self):
+        import sys
+        # Set the loom store path
+        if 'loom.store' in sys.modules:
+            self.previous_os_env = sys.modules['loom.store'].STORE
+        elif 'LOOM_STORE' in os.environ:
+            self.previous_os_env = os.environ['LOOM_STORE']
+        else:
+            self.previous_os_env = None
+
+        os.environ['LOOM_STORE'] = self.loom_store_path
+
+        if 'loom.store' in sys.modules:
+            self.store = reload(sys.modules['loom.store'])
+            self.tasks = reload(sys.modules['loom.tasks'])
+            self.query = reload(sys.modules['loom.query'])
+            self.preql = reload(sys.modules['loom.preql'])
+            self.cFormat = reload(sys.modules['loom.cFormat'])
+            self.schema_pb2 = reload(sys.modules['loom.schema_pb2'])
+        else:
+            self.store = __import__('loom.store').store
+            self.tasks = __import__('loom.tasks').tasks
+            self.query = __import__('loom.query').query
+            self.preql = __import__('loom.preql').preql
+            self.cFormat = __import__('loom.cFormat').cFormat
+            self.schema_pb2 = __import__('loom.schema_pb2').schema_pb2
+        assert sys.modules['loom.store'].STORE == self.loom_store_path
+        return self
+
+    def __exit__(self, type, value, traceback):
+        import sys
+        if self.previous_os_env is not None:
+            os.environ['LOOM_STORE'] = self.previous_os_env
+
+
 class LoomMetamodel(metamodel.IBayesDBMetamodel):
     """Loom metamodel for BayesDB.
 
@@ -144,16 +180,16 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
         self.loom_prefix = loom_prefix
         self.loom_store_path = loom_store_path
         if self.loom_store_path is None:
-            self.loom_store_path = os.path.join(os.path.expanduser('~'),
-            'venv', 'lib', 'python2.7', 'site-packages', 'data')
+            self.loom_store_path = os.path.join(os.getcwd(), 'loomstore')
             if not os.path.isdir(self.loom_store_path):
-                os.makesdir(self.loom_store_path)
+                os.makedirs(self.loom_store_path)
 
         # The cache is a dictionary whose keys are bayeslite.BayesDB objects,
         # and whose values are dictionaries (one cache per bdb). We need
         # self._cache to have separate caches for each bdb because the same
         # instance of LoomMetamodel may be used across multiple bdb instances.
         self._cache = dict()
+        self._loom = _Loom(self.loom_store_path)
 
     def name(self):
         return 'loom'
@@ -197,9 +233,11 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
         # Ingest data into loom
         schema_file = self._data_to_schema(bdb, population_id, data)
         csv_file = self._data_to_csv(bdb, population_id, headers, data)
-        loom.tasks.ingest(
-            self._get_name(bdb, generator_id),
-            rows_csv=csv_file.name, schema=schema_file.name)
+
+        with _Loom(self.loom_store_path) as loom:
+            loom.tasks.ingest(
+                self._get_name(bdb, generator_id),
+                rows_csv=csv_file.name, schema=schema_file.name)
 
         # Store encoding info in bdb
         self._store_encoding_info(bdb, generator_id)
@@ -377,14 +415,15 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
 
         # TODO implement extra passes by appending
         # `config={"schedule": {"extra_passes": 1000}`
-        loom.tasks.infer(name, sample_count=num_models)
-        self._store_kind_partition(bdb, generator_id, modelnos)
+        with _Loom(self.loom_store_path) as loom:
+            loom.tasks.infer(name, sample_count=num_models)
+            self._store_kind_partition(bdb, generator_id, modelnos)
 
-        self._set_cache_entry(bdb, generator_id, 'q_server',
-            loom.query.get_server(
-                self._get_loom_project_path(bdb, generator_id)))
-        self._set_cache_entry(bdb, generator_id, 'preql_server',
-                loom.tasks.query(self._get_name(bdb, generator_id)))
+            self._set_cache_entry(bdb, generator_id, 'q_server',
+                loom.query.get_server(
+                    self._get_loom_project_path(bdb, generator_id)))
+            self._set_cache_entry(bdb, generator_id, 'preql_server',
+                    loom.tasks.query(self._get_name(bdb, generator_id)))
 
     def _store_kind_partition(self, bdb, generator_id, modelnos):
         population_id = core.bayesdb_generator_population(bdb, generator_id)
@@ -445,10 +484,11 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
         assign_in = os.path.join(
             self._get_loom_project_path(bdb, generator_id),
             'samples', 'sample.%d' % (modelno,), 'assign.pbs.gz')
-        assignments = {
-            a.rowid: [a.groupids(k) for k in xrange(num_kinds)]
-            for a in assignment_stream_load(assign_in)
-        }
+        with _Loom(self.loom_store_path) as loom:
+            assignments = {
+                a.rowid: [a.groupids(k) for k in xrange(num_kinds)]
+                for a in loom.cFormat.assignment_stream_load(assign_in)
+            }
         rowids = sorted(assignments)
         return {
             k: [assignments[rowid][k] for rowid in rowids]
@@ -460,7 +500,8 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
         model_in = os.path.join(
             self._get_loom_project_path(bdb, generator_id),
             'samples', 'sample.%d' % (modelno,), 'model.pb.gz')
-        cross_cat = loom.schema_pb2.CrossCat()
+        with _Loom(self.loom_store_path) as loom:
+            cross_cat = loom.schema_pb2.CrossCat()
         with open_compressed(model_in, 'rb') as f:
             cross_cat.ParseFromString(f.read())
         return cross_cat
@@ -514,11 +555,12 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
         server = self._get_cache_entry(bdb, generator_id, 'preql_server')
         target_set = server._cols_to_mask(server.encode_set(colnames0))
         query_set = server._cols_to_mask(server.encode_set(colnames1))
-        mi = server._query_server.mutual_information(
-            target_set,
-            query_set,
-            entropys=None,
-            sample_count=loom.preql.SAMPLE_COUNT)
+        with _Loom(self.loom_store_path) as loom:
+            mi = server._query_server.mutual_information(
+                target_set,
+                query_set,
+                entropys=None,
+                sample_count=loom.preql.SAMPLE_COUNT)
         return mi
 
     def row_similarity(self, bdb, generator_id, modelnos, rowid, target_rowid,
@@ -661,7 +703,8 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
         csv_values = [str(a) for a in csv_values]
 
         outfile = StringIO()
-        writer = loom.preql.CsvWriter(outfile, returns=outfile.getvalue)
+        with _Loom(self.loom_store_path) as loom:
+            writer = loom.preql.CsvWriter(outfile, returns=outfile.getvalue)
         reader = iter([csv_headers]+[csv_values])
         server._predict(reader, num_samples, writer, False)
         output = writer.result()

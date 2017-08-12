@@ -35,7 +35,7 @@ X_MAX, Y_MAX = 200, 100
 def tempdir(prefix):
     path = tempfile.mkdtemp(prefix=prefix)
     try:
-        yield
+        yield path
     finally:
         if os.path.isdir(path):
             shutil.rmtree(path)

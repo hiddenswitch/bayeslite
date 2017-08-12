@@ -30,11 +30,6 @@ on real-world datesets: `dha.csv` and `satellites.csv`.
 '''
 
 def loom_analyze(csv_filename):
-    try:
-        import loom
-    except ImportError:
-        pytest.skip('no loom')
-        return
     with bayesdb_open(':memory:') as bdb:
         bdb = bayesdb_open(':memory:')
         bdb.execute('CREATE TABLE t FROM \'%s\'' % (csv_filename))
