@@ -419,11 +419,14 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
             loom.tasks.infer(name, sample_count=num_models)
             self._store_kind_partition(bdb, generator_id, modelnos)
 
+        self._load_inferences(bdb, generator_id)
+
+    def _load_inferences(self, bdb, generator_id):
+        with _Loom(self.loom_store_path) as loom:
             self._set_cache_entry(bdb, generator_id, 'q_server',
-                loom.query.get_server(
-                    self._get_loom_project_path(bdb, generator_id)))
+                                  loom.query.get_server(self._get_loom_project_path(bdb, generator_id)))
             self._set_cache_entry(bdb, generator_id, 'preql_server',
-                    loom.tasks.query(self._get_name(bdb, generator_id)))
+                                  loom.tasks.query(self._get_name(bdb, generator_id)))
 
     def _store_kind_partition(self, bdb, generator_id, modelnos):
         population_id = core.bayesdb_generator_population(bdb, generator_id)
@@ -552,7 +555,7 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
         colnames1 = [str(core.bayesdb_variable_name(bdb, population_id, colno))
             for colno in colnos1]
 
-        server = self._get_cache_entry(bdb, generator_id, 'preql_server')
+        server = self._retrieve_server(bdb, generator_id)
         target_set = server._cols_to_mask(server.encode_set(colnames0))
         query_set = server._cols_to_mask(server.encode_set(colnames1))
         with _Loom(self.loom_store_path) as loom:
@@ -575,9 +578,16 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
 
         # TODO: cache server
         # Run simlarity query
-        server = self._get_cache_entry(bdb, generator_id, 'preql_server')
+        server = self._retrieve_server(bdb, generator_id)
         output = server.similar([target_row], rows2=[row])
         return float(output)
+
+    def _retrieve_server(self, bdb, generator_id):
+        server = self._get_cache_entry(bdb, generator_id, 'preql_server')
+        if server is None:
+            self._load_inferences(bdb, generator_id)
+            server = self._get_cache_entry(bdb, generator_id, 'preql_server')
+        return server
 
     def _reorder_row(self, bdb, generator_id, row, dense=True):
         """Reorder a row of columns according to loom's column order
@@ -641,7 +651,7 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
             return pred, conf
 
         def _is_categorical(stattype):
-            return casefold(stattype) in ['categorical', 'nominal']
+            return casefold(stattype) in ['categorical', 'nominal', 'unboundedcategorical']
 
         # Retrieve the samples. Specifying `rowid` ensures that relevant
         # constraints are retrieved by `simulate`, so provide empty constraints.
@@ -693,7 +703,7 @@ class LoomMetamodel(metamodel.IBayesDBMetamodel):
         # TODO cache
         # Perform predict query with some boiler plate
         # to make loom using StringIO() and an iterable instead of disk
-        server = self._get_cache_entry(bdb, generator_id, 'preql_server')
+        server = self._retrieve_server(bdb, generator_id)
 
         # Loom only uses lowercased headers
         # TODO race condition if bayesdb is case sensitive
